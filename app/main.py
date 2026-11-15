@@ -14,6 +14,7 @@ from models import Monitor, CheckLog
 from schemas import MonitorCreate, MonitorOut
 from checker import check_single_monitor
 
+# Do konfiguracji czasu itp
 
 CHECK_INTERVAL_MINUTES = 1
 MAX_CONCURRENT_CHECKS = 10
