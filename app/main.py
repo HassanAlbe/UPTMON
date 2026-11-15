@@ -14,7 +14,7 @@ from models import Monitor, CheckLog
 from schemas import MonitorCreate, MonitorOut
 from checker import check_single_monitor
 
-# Do konfiguracji czasu itp
+# Konfiguracji czasu itp 
 
 CHECK_INTERVAL_MINUTES = 1
 MAX_CONCURRENT_CHECKS = 10
@@ -151,9 +151,6 @@ def list_monitors(db: Session = Depends(get_db)):
     )
 
 
-# ==========================================
-# DELETE MONITOR
-# ==========================================
 
 @app.delete("/api/monitors/{monitor_id}")
 def delete_monitor(
@@ -694,6 +691,40 @@ footer {
     display: block;
 }
 
+
+.connection-toast {
+    position: fixed;
+    top: 22px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-18px);
+    z-index: 1000;
+    width: max-content;
+    max-width: calc(100vw - 32px);
+    padding: 13px 20px;
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 700;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .25s ease, transform .25s ease;
+    box-shadow: 0 10px 35px rgba(0,0,0,.35);
+}
+.connection-toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}
+.connection-toast.online {
+    color: #86efac;
+    background: #123323;
+    border: 1px solid #23834b;
+}
+.connection-toast.offline {
+    color: #fca5a5;
+    background: #3b1820;
+    border: 1px solid #a83b4a;
+}
+
 @media(max-width: 850px) {
     .stats {
         grid-template-columns: repeat(2, 1fr);
@@ -929,6 +960,7 @@ footer {
 </div>
 
 <div class="toast" id="toast"></div>
+<div class="connection-toast" id="connectionToast" role="status" aria-live="polite"></div>
 
 
 <script>
@@ -937,6 +969,64 @@ const API = "/api";
 let currentMonitors = [];
 let refreshTimer = null;
 
+
+let lastInternetState = null;
+let connectionToastTimer = null;
+let internetCheckInProgress = false;
+
+function showConnectionToast(isOnline, initial = false) {
+    const toast = document.getElementById("connectionToast");
+    if (!toast) return;
+
+    toast.className = "connection-toast " + (isOnline ? "online" : "offline");
+    toast.textContent = isOnline
+        ? (initial ? "You are online" : "Connection restored — you are online")
+        : (initial ? "You are online" : "Connection lost — you are offline");
+
+    toast.classList.add("show");
+    clearTimeout(connectionToastTimer);
+    connectionToastTimer = setTimeout(() => toast.classList.remove("show"), 5000);
+}
+
+async function checkInternetConnection() {
+    if (internetCheckInProgress) return;
+    internetCheckInProgress = true;
+
+    let isOnline = false;
+    try {
+        if (navigator.onLine === false) {
+            throw new Error("Browser reports offline");
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+
+        try {
+            // no-cors pozwala sprawdzić osiągalność serwera bez odczytywania jego odpowiedzi.
+            await fetch("https://www.gstatic.com/generate_204", {
+                method: "GET",
+                mode: "no-cors",
+                cache: "no-store",
+                signal: controller.signal
+            });
+            isOnline = true;
+        } finally {
+            clearTimeout(timeout);
+        }
+    } catch {
+        isOnline = false;
+    } finally {
+        internetCheckInProgress = false;
+    }
+
+    if (lastInternetState === null) {
+        lastInternetState = isOnline;
+        showConnectionToast(isOnline, true);
+    } else if (lastInternetState !== isOnline) {
+        lastInternetState = isOnline;
+        showConnectionToast(isOnline);
+    }
+}
 
 function showToast(message) {
     const toast = document.getElementById("toast");
@@ -1393,6 +1483,12 @@ document.getElementById("addForm").addEventListener(
 
 
 loadMonitors();
+
+
+checkInternetConnection();
+setInterval(checkInternetConnection, 10000);
+window.addEventListener("online", checkInternetConnection);
+window.addEventListener("offline", checkInternetConnection);
 
 refreshTimer = setInterval(loadMonitors, 15000);
 
