@@ -1,12 +1,12 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from html import escape
+from difflib import SequenceMatcher
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from database import engine, Base, SessionLocal, get_db
@@ -14,20 +14,80 @@ from models import Monitor, CheckLog
 from schemas import MonitorCreate, MonitorOut
 from checker import check_single_monitor
 
-# Konfiguracji czasu itp 
 
 CHECK_INTERVAL_MINUTES = 1
 MAX_CONCURRENT_CHECKS = 10
+HISTORY_PAGE_SIZE = 100
 
 check_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
 
+KNOWN_DOMAINS = [
+    "google.com",
+    "roblox.com",
+    "youtube.com",
+    "discord.com",
+    "github.com",
+    "wikipedia.org",
+    "reddit.com",
+    "twitch.tv",
+    "tiktok.com",
+    "instagram.com",
+    "facebook.com",
+    "microsoft.com",
+    "apple.com",
+    "amazon.com",
+    "netflix.com",
+    "steam.com",
+    "openai.com",
+    "spotify.com",
+    "paypal.com",
+    "yahoo.com",
+    "bing.com",
+    "cloudflare.com",
+    "minecraft.net",
+    "epicgames.com",
+    "x.com",
+]
+
+
+
+def suggest_domain(value: str):
+    value = value.strip().lower()
+
+    if "://" in value:
+        value = urlsplit(value).hostname or value
+
+    value = value.split("/")[0].removeprefix("www.")
+
+    if value in KNOWN_DOMAINS:
+        return None
+
+    best_match = None
+    best_score = 0
+
+    for domain in KNOWN_DOMAINS:
+        score = SequenceMatcher(None, value, domain).ratio()
+
+        if score > best_score:
+            best_score = score
+            best_match = domain
+
+    if best_score >= 0.78:
+        return best_match
+
+    return None
+
+
 
 async def check_monitor_by_id(monitor_id: int):
+
     async with check_semaphore:
+
         db = SessionLocal()
 
         try:
+
             monitor = (
                 db.query(Monitor)
                 .filter(Monitor.id == monitor_id)
@@ -38,25 +98,33 @@ async def check_monitor_by_id(monitor_id: int):
                 await check_single_monitor(db, monitor)
 
         except Exception as exc:
+
             db.rollback()
             print(f"[Monitor {monitor_id}] Error: {exc}")
 
         finally:
+
             db.close()
 
 
 async def run_all_checks():
+
     db = SessionLocal()
 
     try:
+
         monitor_ids = [
             monitor_id
             for (monitor_id,) in db.query(Monitor.id).all()
         ]
+
     except Exception as exc:
+
         print(f"[Scheduler] Database error: {exc}")
         return
+
     finally:
+
         db.close()
 
     if not monitor_ids:
@@ -90,6 +158,7 @@ async def lifespan(app: FastAPI):
     )
 
     scheduler.start()
+
     app.state.scheduler = scheduler
 
     print("[UPTMON] Scheduler started.")
@@ -115,6 +184,7 @@ async def create_monitor(
     payload: MonitorCreate,
     db: Session = Depends(get_db)
 ):
+
     monitor = Monitor(
         name=payload.name,
         url=str(payload.url),
@@ -125,6 +195,7 @@ async def create_monitor(
     )
 
     try:
+
         db.add(monitor)
         db.commit()
         db.refresh(monitor)
@@ -136,6 +207,7 @@ async def create_monitor(
         return monitor
 
     except Exception:
+
         db.rollback()
         raise
 
@@ -165,18 +237,21 @@ def delete_monitor(
     )
 
     if not monitor:
+
         raise HTTPException(
             status_code=404,
             detail="Monitor not found"
         )
 
     try:
+
         db.delete(monitor)
         db.commit()
 
         return {"success": True}
 
     except Exception:
+
         db.rollback()
         raise
 
@@ -195,18 +270,47 @@ async def manual_check(
     )
 
     if not monitor:
+
         raise HTTPException(
             status_code=404,
             detail="Monitor not found"
         )
 
     await check_single_monitor(db, monitor)
+
     db.refresh(monitor)
 
     return {
         "success": True,
         "is_up": monitor.is_up,
         "last_checked": monitor.last_checked
+    }
+
+
+
+@app.post("/api/monitors/check-all")
+async def check_all_monitors():
+
+    await run_all_checks()
+
+    return {
+        "success": True,
+        "message": "All monitors checked"
+    }
+
+
+
+@app.get("/api/domains/suggest")
+def domain_suggestion(
+    domain: str = Query(min_length=3, max_length=253)
+):
+
+    suggestion = suggest_domain(domain)
+
+    return {
+        "original": domain,
+        "suggestion": suggestion,
+        "has_suggestion": suggestion is not None
     }
 
 
@@ -223,6 +327,7 @@ def monitor_history(
     ).first()
 
     if not monitor:
+
         raise HTTPException(
             status_code=404,
             detail="Monitor not found"
@@ -249,6 +354,61 @@ def monitor_history(
 
 
 
+@app.get("/api/monitors/{monitor_id}/history/full")
+def full_monitor_history(
+    monitor_id: int,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db)
+):
+
+    monitor = db.query(Monitor).filter(
+        Monitor.id == monitor_id
+    ).first()
+
+    if not monitor:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Monitor not found"
+        )
+
+    query = (
+        db.query(CheckLog)
+        .filter(CheckLog.monitor_id == monitor_id)
+    )
+
+    total = query.count()
+
+    logs = (
+        query
+        .order_by(CheckLog.checked_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    items = [
+        {
+            "status_code": log.status_code,
+            "response_time_ms": log.response_time_ms,
+            "is_up": log.is_up,
+            "error_message": log.error_message,
+            "checked_at": log.checked_at
+        }
+        for log in logs
+    ]
+
+    return {
+        "items": items,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(items) < total
+    }
+
+
+
 @app.get("/api/monitors/{monitor_id}/stats")
 def monitor_stats(
     monitor_id: int,
@@ -261,6 +421,7 @@ def monitor_stats(
     ).first()
 
     if not monitor:
+
         raise HTTPException(
             status_code=404,
             detail="Monitor not found"
@@ -325,7 +486,9 @@ def dashboard():
     return HTMLResponse(content=r"""
 <!DOCTYPE html>
 <html lang="pl">
+
 <head>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#080d18">
@@ -497,6 +660,11 @@ header {
     background: #0369a1;
 }
 
+.primary:disabled {
+    opacity: .6;
+    cursor: not-allowed;
+}
+
 .secondary {
     border: 1px solid var(--border);
     background: var(--panel2);
@@ -613,6 +781,37 @@ input::placeholder {
     border-radius: 10px;
 }
 
+.tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 18px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.tab {
+    background: var(--panel2);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 9px 15px;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 650;
+    transition: .2s;
+}
+
+.tab:hover {
+    border-color: var(--blue);
+    color: var(--text);
+}
+
+.tab.active {
+    background: #123047;
+    color: var(--blue);
+    border-color: var(--blue);
+}
+
 .details {
     display: none;
 }
@@ -691,7 +890,6 @@ footer {
     display: block;
 }
 
-
 .connection-toast {
     position: fixed;
     top: 22px;
@@ -710,19 +908,37 @@ footer {
     transition: opacity .25s ease, transform .25s ease;
     box-shadow: 0 10px 35px rgba(0,0,0,.35);
 }
+
 .connection-toast.show {
     opacity: 1;
     transform: translateX(-50%) translateY(0);
 }
+
 .connection-toast.online {
     color: #86efac;
     background: #123323;
     border: 1px solid #23834b;
 }
+
 .connection-toast.offline {
     color: #fca5a5;
     background: #3b1820;
     border: 1px solid #a83b4a;
+}
+
+/* Dodatkowy element podpowiedzi w stylu oryginalnego panelu. */
+.domain-suggestion {
+    display: none;
+    margin-top: 14px;
+    padding: 14px;
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+}
+
+.domain-suggestion p {
+    font-size: 13px;
+    margin-bottom: 12px;
 }
 
 @media(max-width: 850px) {
@@ -784,9 +1000,14 @@ footer {
     .panel {
         padding: 15px;
     }
+
+    .history-item {
+        flex-direction: column;
+    }
 }
 
 </style>
+
 </head>
 
 <body>
@@ -794,6 +1015,7 @@ footer {
 <div class="layout">
 
 <header>
+
     <div>
         <div class="logo">UPT<span>MON</span></div>
         <div class="subtitle">Website uptime monitoring</div>
@@ -803,10 +1025,12 @@ footer {
         <span class="dot"></span>
         Monitoring active
     </div>
+
 </header>
 
 
 <section>
+
     <h2 class="section-title">Overview</h2>
 
     <div class="stats">
@@ -836,6 +1060,7 @@ footer {
         </div>
 
     </div>
+
 </section>
 
 
@@ -860,8 +1085,9 @@ footer {
 
             <input
                 id="url"
-                type="url"
-                placeholder="https://example.com"
+                type="text"
+                placeholder="example.com or https://example.com"
+                autocomplete="url"
                 required
             >
 
@@ -879,24 +1105,94 @@ footer {
 
     </form>
 
+    <div class="domain-suggestion" id="domainSuggestion">
+        <p id="suggestionText"></p>
+
+        <button
+            type="button"
+            class="primary"
+            id="acceptSuggestion"
+        >
+            Use suggestion
+        </button>
+
+        <button
+            type="button"
+            class="secondary"
+            id="rejectSuggestion"
+        >
+            Keep my address
+        </button>
+    </div>
+
 </section>
 
 
 <section class="panel">
 
     <div class="panel-header">
+
         <div>
             <h2>Monitored services</h2>
             <div class="muted">Live monitoring overview</div>
         </div>
 
-        <button class="secondary" onclick="loadMonitors()">
-            Refresh
-        </button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+
+            <button class="secondary" onclick="loadMonitors()">
+                Refresh
+            </button>
+
+            <button
+                class="primary"
+                id="checkAllButton"
+                onclick="checkAllMonitors()"
+            >
+                Check all
+            </button>
+
+        </div>
+
     </div>
 
+
+    <div class="tabs">
+
+        <button
+            class="tab active"
+            data-filter="all"
+            onclick="filterMonitors('all', this)"
+        >
+            All <span id="countAll">0</span>
+        </button>
+
+        <button
+            class="tab"
+            data-filter="online"
+            onclick="filterMonitors('online', this)"
+        >
+            <span class="green">●</span>
+            Online <span id="countOnline">0</span>
+        </button>
+
+        <button
+            class="tab"
+            data-filter="offline"
+            onclick="filterMonitors('offline', this)"
+        >
+            <span class="red">●</span>
+            Offline <span id="countOffline">0</span>
+        </button>
+
+    </div>
+
+
     <div class="monitor-list" id="monitorList">
-        <div class="empty">Loading monitors...</div>
+
+        <div class="empty">
+            Loading monitors...
+        </div>
+
     </div>
 
 </section>
@@ -905,6 +1201,7 @@ footer {
 <section class="panel details" id="details">
 
     <div class="panel-header">
+
         <div>
             <h2 id="detailName">Monitor details</h2>
             <div class="muted" id="detailUrl"></div>
@@ -913,7 +1210,9 @@ footer {
         <button class="secondary" onclick="closeDetails()">
             Close
         </button>
+
     </div>
+
 
     <div class="detail-stats">
 
@@ -934,6 +1233,7 @@ footer {
 
     </div>
 
+
     <h3 style="font-size:14px;margin-bottom:15px">
         Response time history
     </h3>
@@ -942,96 +1242,181 @@ footer {
         <canvas id="responseChart"></canvas>
     </div>
 
+
     <h3 style="font-size:14px;margin:20px 0 12px">
-        Recent checks
+        Check history
     </h3>
 
     <div class="history" id="historyList"></div>
+
+    <div
+        id="historyCounter"
+        class="muted"
+        style="margin-top:14px"
+    >
+        Loading history...
+    </div>
+
+    <button
+        class="secondary"
+        id="loadMoreHistoryButton"
+        onclick="loadOlderHistory()"
+        style="display:none;margin-top:14px"
+    >
+        Load older checks
+    </button>
 
 </section>
 
 
 <footer>
+
     UPTMON · Website Monitoring System
+
     <br>
+
     <span id="lastUpdate">Waiting for data...</span>
+
 </footer>
 
 </div>
 
+
 <div class="toast" id="toast"></div>
-<div class="connection-toast" id="connectionToast" role="status" aria-live="polite"></div>
+
+<div
+    class="connection-toast"
+    id="connectionToast"
+    role="status"
+    aria-live="polite"
+></div>
 
 
 <script>
 
 const API = "/api";
+
 let currentMonitors = [];
 let refreshTimer = null;
-
+let currentFilter = "all";
 
 let lastInternetState = null;
 let connectionToastTimer = null;
 let internetCheckInProgress = false;
 
+// Full history state
+let currentMonitorId = null;
+let currentHistory = [];
+let historyOffset = 0;
+let historyTotal = 0;
+
+const HISTORY_PAGE_SIZE = 100;
+
+// Domain suggestion state
+let pendingDomainSuggestion = null;
+let suggestionTimer = null;
+
+
+
 function showConnectionToast(isOnline, initial = false) {
+
     const toast = document.getElementById("connectionToast");
+
     if (!toast) return;
 
-    toast.className = "connection-toast " + (isOnline ? "online" : "offline");
+    toast.className =
+        "connection-toast " + (isOnline ? "online" : "offline");
+
     toast.textContent = isOnline
-        ? (initial ? "You are online" : "Connection restored — you are online")
-        : (initial ? "You are online" : "Connection lost — you are offline");
+        ? (initial
+            ? "You are online"
+            : "Connection restored — you are online")
+        : (initial
+            ? "You are offline"
+            : "Connection lost — you are offline");
 
     toast.classList.add("show");
+
     clearTimeout(connectionToastTimer);
-    connectionToastTimer = setTimeout(() => toast.classList.remove("show"), 5000);
+
+    connectionToastTimer = setTimeout(() => {
+        toast.classList.remove("show");
+    }, 5000);
 }
 
+
 async function checkInternetConnection() {
+
     if (internetCheckInProgress) return;
+
     internetCheckInProgress = true;
 
     let isOnline = false;
+
     try {
+
         if (navigator.onLine === false) {
             throw new Error("Browser reports offline");
         }
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
+
+        const timeout = setTimeout(
+            () => controller.abort(),
+            5000
+        );
 
         try {
-            // no-cors pozwala sprawdzić osiągalność serwera bez odczytywania jego odpowiedzi.
-            await fetch("https://www.gstatic.com/generate_204", {
-                method: "GET",
-                mode: "no-cors",
-                cache: "no-store",
-                signal: controller.signal
-            });
+
+            await fetch(
+                "https://www.gstatic.com/generate_204",
+                {
+                    method: "GET",
+                    mode: "no-cors",
+                    cache: "no-store",
+                    signal: controller.signal
+                }
+            );
+
             isOnline = true;
+
         } finally {
+
             clearTimeout(timeout);
+
         }
+
     } catch {
+
         isOnline = false;
+
     } finally {
+
         internetCheckInProgress = false;
+
     }
 
     if (lastInternetState === null) {
+
         lastInternetState = isOnline;
         showConnectionToast(isOnline, true);
+
     } else if (lastInternetState !== isOnline) {
+
         lastInternetState = isOnline;
         showConnectionToast(isOnline);
+
     }
 }
 
+
+
 function showToast(message) {
+
     const toast = document.getElementById("toast");
 
     toast.textContent = message;
+
     toast.classList.add("show");
 
     setTimeout(() => {
@@ -1040,16 +1425,21 @@ function showToast(message) {
 }
 
 
+
 async function apiFetch(url, options = {}) {
 
     const response = await fetch(url, options);
 
     if (!response.ok) {
+
         let message = "Request failed";
 
         try {
+
             const data = await response.json();
+
             message = data.detail || message;
+
         } catch {}
 
         throw new Error(message);
@@ -1057,6 +1447,7 @@ async function apiFetch(url, options = {}) {
 
     return response.json();
 }
+
 
 
 function createElement(tag, className, text) {
@@ -1075,6 +1466,146 @@ function createElement(tag, className, text) {
 }
 
 
+
+function filterMonitors(filter, button) {
+
+    currentFilter = filter;
+
+    document.querySelectorAll(".tab").forEach(tab => {
+        tab.classList.remove("active");
+    });
+
+    button.classList.add("active");
+
+    renderMonitors();
+}
+
+
+
+function renderMonitors() {
+
+    const list = document.getElementById("monitorList");
+
+    let filtered = currentMonitors;
+
+    if (currentFilter === "online") {
+
+        filtered = currentMonitors.filter(
+            m => m.is_up === true
+        );
+
+    }
+
+    if (currentFilter === "offline") {
+
+        filtered = currentMonitors.filter(
+            m => m.is_up === false
+        );
+
+    }
+
+    list.replaceChildren();
+
+    if (!filtered.length) {
+
+        list.append(
+            createElement(
+                "div",
+                "empty",
+                currentFilter === "online"
+                    ? "No online monitors."
+                    : currentFilter === "offline"
+                        ? "No offline monitors."
+                        : "No monitors yet."
+            )
+        );
+
+        return;
+    }
+
+    filtered.forEach(monitor => {
+
+        const card = createElement("div", "monitor");
+
+        const info = createElement("div");
+
+        info.append(
+            createElement(
+                "div",
+                "monitor-name",
+                monitor.name
+            ),
+            createElement(
+                "div",
+                "monitor-url",
+                monitor.url
+            )
+        );
+
+        const statusClass =
+            monitor.is_up === true ? "up" :
+            monitor.is_up === false ? "down" : "pending";
+
+        const statusText =
+            monitor.is_up === true ? "ONLINE" :
+            monitor.is_up === false ? "OFFLINE" : "UNKNOWN";
+
+        const status = createElement(
+            "span",
+            "status " + statusClass,
+            statusText
+        );
+
+        const statusColumn = createElement("div");
+
+        statusColumn.append(status);
+
+        const actions = createElement(
+            "div",
+            "monitor-actions"
+        );
+
+        const details = createElement(
+            "button",
+            "secondary",
+            "Details"
+        );
+
+        details.addEventListener("click", () => {
+            showDetails(monitor);
+        });
+
+        const check = createElement(
+            "button",
+            "secondary",
+            "Check"
+        );
+
+        check.addEventListener("click", () => {
+            runManualCheck(monitor.id, check);
+        });
+
+        const remove = createElement(
+            "button",
+            "danger",
+            "Delete"
+        );
+
+        remove.addEventListener("click", () => {
+            deleteMonitor(monitor.id);
+        });
+
+        actions.append(details, check, remove);
+
+        card.append(info, statusColumn, actions);
+
+        list.append(card);
+
+    });
+}
+
+
+
 async function loadMonitors() {
 
     const list = document.getElementById("monitorList");
@@ -1085,110 +1616,89 @@ async function loadMonitors() {
 
         currentMonitors = data;
 
-        document.getElementById("total").textContent = data.length;
+        const online = data.filter(
+            m => m.is_up === true
+        ).length;
 
-        const online = data.filter(m => m.is_up === true).length;
-        const offline = data.filter(m => m.is_up === false).length;
+        const offline = data.filter(
+            m => m.is_up === false
+        ).length;
 
-        document.getElementById("online").textContent = online;
-        document.getElementById("offline").textContent = offline;
+        document.getElementById("total").textContent =
+            data.length;
+
+        document.getElementById("online").textContent =
+            online;
+
+        document.getElementById("offline").textContent =
+            offline;
+
+        document.getElementById("countAll").textContent =
+            data.length;
+
+        document.getElementById("countOnline").textContent =
+            online;
+
+        document.getElementById("countOffline").textContent =
+            offline;
 
         if (!data.length) {
 
-            list.replaceChildren(
-                createElement("div", "empty", "No monitors yet. Add your first website above.")
-            );
+            renderMonitors();
 
             document.getElementById("average").textContent = "--";
-            document.getElementById("lastUpdate").textContent = "Updated just now";
+
+            document.getElementById("lastUpdate").textContent =
+                "Updated just now";
 
             return;
         }
 
         const cards = await Promise.all(
+
             data.map(async monitor => {
 
                 try {
+
                     const stats = await apiFetch(
                         `${API}/monitors/${monitor.id}/stats`
                     );
 
-                    return { monitor, stats };
+                    return {
+                        monitor,
+                        stats
+                    };
 
                 } catch {
-                    return { monitor, stats: null };
+
+                    return {
+                        monitor,
+                        stats: null
+                    };
+
                 }
+
             })
+
         );
 
         let responseTotal = 0;
         let responseCount = 0;
 
-        list.replaceChildren();
-
-        for (const { monitor, stats } of cards) {
-
-            const card = createElement("div", "monitor");
-
-            const info = createElement("div");
-            const name = createElement("div", "monitor-name", monitor.name);
-            const url = createElement("div", "monitor-url", monitor.url);
-
-            info.append(name, url);
-
-            const status = createElement(
-                "span",
-                "status " + (
-                    monitor.is_up === true ? "up" :
-                    monitor.is_up === false ? "down" : "pending"
-                ),
-                monitor.is_up === true ? "ONLINE" :
-                monitor.is_up === false ? "OFFLINE" : "UNKNOWN"
-            );
+        for (const { stats } of cards) {
 
             const metric = stats?.latest_response_time;
 
-            const metricBox = createElement(
-                "div",
-                "muted",
-                metric !== null && metric !== undefined
-                    ? `${metric} ms`
-                    : "-- ms"
-            );
-
             if (metric !== null && metric !== undefined) {
+
                 responseTotal += metric;
                 responseCount++;
+
             }
 
-            const statusColumn = createElement("div");
-            statusColumn.append(status, metricBox);
-
-            const actions = createElement("div", "monitor-actions");
-
-            const detailsButton = createElement("button", "secondary", "Details");
-
-            detailsButton.addEventListener("click", () => {
-                showDetails(monitor);
-            });
-
-            const checkButton = createElement("button", "secondary", "Check");
-
-            checkButton.addEventListener("click", () => {
-                runManualCheck(monitor.id, checkButton);
-            });
-
-            const deleteButton = createElement("button", "danger", "Delete");
-
-            deleteButton.addEventListener("click", () => {
-                deleteMonitor(monitor.id);
-            });
-
-            actions.append(detailsButton, checkButton, deleteButton);
-
-            card.append(info, statusColumn, actions);
-            list.append(card);
         }
+
+        renderMonitors();
 
         document.getElementById("average").textContent =
             responseCount
@@ -1196,15 +1706,159 @@ async function loadMonitors() {
                 : "--";
 
         document.getElementById("lastUpdate").textContent =
-            "Last updated: " + new Date().toLocaleTimeString();
+            "Last updated: " +
+            new Date().toLocaleTimeString();
 
     } catch (error) {
 
         list.replaceChildren(
-            createElement("div", "empty", "Could not load monitors: " + error.message)
+            createElement(
+                "div",
+                "empty",
+                "Could not load monitors: " + error.message
+            )
         );
+
     }
+
 }
+
+
+
+async function checkAllMonitors() {
+
+    const button = document.getElementById("checkAllButton");
+
+    button.disabled = true;
+    button.textContent = "Checking all...";
+
+    try {
+
+        await apiFetch(
+            `${API}/monitors/check-all`,
+            {
+                method: "POST"
+            }
+        );
+
+        showToast("All monitors checked successfully.");
+
+        await loadMonitors();
+
+        // Odśwież szczegóły, jeśli są otwarte.
+        if (currentMonitorId !== null) {
+            const monitor = currentMonitors.find(
+                m => m.id === currentMonitorId
+            );
+
+            if (monitor) {
+                await showDetails(monitor, false);
+            }
+        }
+
+    } catch (error) {
+
+        showToast(error.message);
+
+    } finally {
+
+        button.disabled = false;
+        button.textContent = "✓ Check all";
+
+    }
+
+}
+
+
+
+const urlInput = document.getElementById("url");
+
+urlInput.addEventListener("input", () => {
+
+    clearTimeout(suggestionTimer);
+
+    suggestionTimer = setTimeout(
+        checkDomainSuggestion,
+        500
+    );
+
+});
+
+
+async function checkDomainSuggestion() {
+
+    const value = urlInput.value.trim();
+
+    if (value.length < 3) {
+
+        hideDomainSuggestion();
+
+        return;
+    }
+
+    try {
+
+        const result = await apiFetch(
+            `${API}/domains/suggest?domain=${encodeURIComponent(value)}`
+        );
+
+        // Nie pokazuj starej odpowiedzi, jeśli użytkownik
+        // zdążył już wpisać inny adres.
+        if (urlInput.value.trim() !== value) return;
+
+        if (!result.has_suggestion) {
+
+            hideDomainSuggestion();
+
+            return;
+        }
+
+        pendingDomainSuggestion = result.suggestion;
+
+        document.getElementById("suggestionText").textContent =
+            `Did you mean ${result.suggestion}?`;
+
+        document.getElementById("domainSuggestion").style.display =
+            "block";
+
+    } catch (error) {
+
+        console.error(error);
+
+    }
+
+}
+
+
+function hideDomainSuggestion() {
+
+    pendingDomainSuggestion = null;
+
+    document.getElementById("domainSuggestion").style.display =
+        "none";
+
+}
+
+
+document.getElementById("acceptSuggestion").addEventListener(
+    "click",
+    () => {
+
+        if (!pendingDomainSuggestion) return;
+
+        urlInput.value = pendingDomainSuggestion;
+
+        hideDomainSuggestion();
+
+    }
+);
+
+
+document.getElementById("rejectSuggestion").addEventListener(
+    "click",
+    hideDomainSuggestion
+);
+
 
 
 async function addMonitor(event) {
@@ -1214,11 +1868,15 @@ async function addMonitor(event) {
     const button = document.getElementById("addButton");
 
     const name = document.getElementById("name").value.trim();
+
     const url = document.getElementById("url").value.trim();
+
     const webhook = document.getElementById("webhook").value.trim();
 
     if (!name || !url) {
+
         showToast("Please fill in the required fields.");
+
         return;
     }
 
@@ -1227,19 +1885,26 @@ async function addMonitor(event) {
 
     try {
 
-        await apiFetch(`${API}/monitors`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                name,
-                url,
-                webhook_url: webhook || null
-            })
-        });
+        await apiFetch(
+            `${API}/monitors`,
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type": "application/json"
+                },
+
+                body: JSON.stringify({
+                    name,
+                    url,
+                    webhook_url: webhook || null
+                })
+            }
+        );
 
         document.getElementById("addForm").reset();
+
+        hideDomainSuggestion();
 
         showToast("Monitor added successfully.");
 
@@ -1253,8 +1918,11 @@ async function addMonitor(event) {
 
         button.disabled = false;
         button.textContent = "+ Add monitor";
+
     }
+
 }
+
 
 
 async function deleteMonitor(id) {
@@ -1265,20 +1933,29 @@ async function deleteMonitor(id) {
 
     try {
 
-        await apiFetch(`${API}/monitors/${id}`, {
-            method: "DELETE"
-        });
+        await apiFetch(
+            `${API}/monitors/${id}`,
+            {
+                method: "DELETE"
+            }
+        );
 
         showToast("Monitor deleted.");
 
-        closeDetails();
+        if (currentMonitorId === id) {
+            closeDetails();
+        }
+
         await loadMonitors();
 
     } catch (error) {
 
         showToast(error.message);
+
     }
+
 }
+
 
 
 async function runManualCheck(id, button) {
@@ -1288,13 +1965,28 @@ async function runManualCheck(id, button) {
 
     try {
 
-        await apiFetch(`${API}/monitors/${id}/check`, {
-            method: "POST"
-        });
+        await apiFetch(
+            `${API}/monitors/${id}/check`,
+            {
+                method: "POST"
+            }
+        );
 
         showToast("Check completed.");
 
         await loadMonitors();
+
+        if (currentMonitorId === id) {
+
+            const monitor = currentMonitors.find(
+                m => m.id === id
+            );
+
+            if (monitor) {
+                await showDetails(monitor, false);
+            }
+
+        }
 
     } catch (error) {
 
@@ -1304,29 +1996,62 @@ async function runManualCheck(id, button) {
 
         button.disabled = false;
         button.textContent = "Check";
+
     }
+
 }
 
 
-async function showDetails(monitor) {
+
+async function showDetails(monitor, scroll = true) {
 
     const panel = document.getElementById("details");
 
+    currentMonitorId = monitor.id;
+
+    currentHistory = [];
+    historyOffset = 0;
+    historyTotal = 0;
+
     panel.classList.add("active");
 
-    document.getElementById("detailName").textContent = monitor.name;
-    document.getElementById("detailUrl").textContent = monitor.url;
+    document.getElementById("detailName").textContent =
+        monitor.name;
+
+    document.getElementById("detailUrl").textContent =
+        monitor.url;
 
     document.getElementById("detailUptime").textContent = "--";
+
     document.getElementById("detailAverage").textContent = "--";
+
     document.getElementById("detailChecks").textContent = "--";
+
+    document.getElementById("historyList").replaceChildren();
+
+    document.getElementById("historyCounter").textContent =
+        "Loading history...";
+
+    document.getElementById("loadMoreHistoryButton").style.display =
+        "none";
 
     try {
 
         const [stats, history] = await Promise.all([
-            apiFetch(`${API}/monitors/${monitor.id}/stats?hours=24`),
-            apiFetch(`${API}/monitors/${monitor.id}/history?limit=50`)
+
+            apiFetch(
+                `${API}/monitors/${monitor.id}/stats?hours=24`
+            ),
+
+            apiFetch(
+                `${API}/monitors/${monitor.id}/history/full?limit=${HISTORY_PAGE_SIZE}&offset=0`
+            )
+
         ]);
+
+        // Zapobiega nadpisaniu szczegółów innego monitora,
+        // jeśli poprzednie zapytanie zakończy się później.
+        if (currentMonitorId !== monitor.id) return;
 
         document.getElementById("detailUptime").textContent =
             `${stats.uptime_percentage}%`;
@@ -1339,72 +2064,179 @@ async function showDetails(monitor) {
         document.getElementById("detailChecks").textContent =
             stats.total_checks;
 
-        drawChart(history);
+        currentHistory = history.items;
 
-        const historyList = document.getElementById("historyList");
-        historyList.replaceChildren();
+        historyOffset = history.items.length;
 
-        if (!history.length) {
-            historyList.append(
-                createElement("div", "empty", "No history available.")
-            );
+        historyTotal = history.total;
+
+        drawChart(currentHistory);
+
+        renderFullHistory();
+
+        if (scroll) {
+            panel.scrollIntoView({
+                behavior: "smooth",
+                block: "start"
+            });
         }
-
-        for (const item of history) {
-
-            const row = createElement("div", "history-item");
-
-            const left = createElement(
-                "span",
-                item.is_up ? "green" : "red",
-                item.is_up ? "ONLINE" : "OFFLINE"
-            );
-
-            const right = createElement(
-                "span",
-                "muted",
-                `${item.response_time_ms ?? "--"} ms · ${
-                    item.checked_at
-                        ? new Date(item.checked_at).toLocaleString()
-                        : "Unknown time"
-                }`
-            );
-
-            row.append(left, right);
-            historyList.append(row);
-        }
-
-        panel.scrollIntoView({
-            behavior: "smooth",
-            block: "start"
-        });
 
     } catch (error) {
 
-        showToast("Could not load monitor details: " + error.message);
+        showToast(
+            "Could not load monitor details: " + error.message
+        );
+
+        document.getElementById("historyCounter").textContent =
+            "Could not load history.";
+
     }
+
 }
+
+
+
+function renderFullHistory() {
+
+    const historyList = document.getElementById("historyList");
+
+    const counter = document.getElementById("historyCounter");
+
+    const button = document.getElementById("loadMoreHistoryButton");
+
+    counter.textContent =
+        `Showing ${currentHistory.length} of ${historyTotal} checks`;
+
+    historyList.replaceChildren();
+
+    if (!currentHistory.length) {
+
+        historyList.append(
+            createElement(
+                "div",
+                "empty",
+                "No history available."
+            )
+        );
+
+    }
+
+    for (const item of currentHistory) {
+
+        const row = createElement(
+            "div",
+            "history-item"
+        );
+
+        const left = createElement(
+            "span",
+            item.is_up ? "green" : "red",
+            item.is_up ? "● ONLINE" : "● OFFLINE"
+        );
+
+        const right = createElement(
+            "span",
+            "muted",
+            `${item.response_time_ms ?? "--"} ms · ${
+                item.checked_at
+                    ? new Date(item.checked_at).toLocaleString()
+                    : "Unknown time"
+            }`
+        );
+
+        row.append(left, right);
+
+        historyList.append(row);
+
+    }
+
+    button.style.display =
+        historyOffset < historyTotal
+            ? "inline-block"
+            : "none";
+
+}
+
+
+
+async function loadOlderHistory() {
+
+    if (currentMonitorId === null) return;
+
+    if (historyOffset >= historyTotal) return;
+
+    const button = document.getElementById(
+        "loadMoreHistoryButton"
+    );
+
+    const monitorId = currentMonitorId;
+
+    button.disabled = true;
+
+    button.textContent = "Loading...";
+
+    try {
+
+        const result = await apiFetch(
+            `${API}/monitors/${monitorId}/history/full?limit=${HISTORY_PAGE_SIZE}&offset=${historyOffset}`
+        );
+
+        if (currentMonitorId !== monitorId) return;
+
+        currentHistory = currentHistory.concat(result.items);
+
+        historyOffset += result.items.length;
+
+        historyTotal = result.total;
+
+        renderFullHistory();
+
+        drawChart(currentHistory);
+
+    } catch (error) {
+
+        showToast(error.message);
+
+    } finally {
+
+        button.disabled = false;
+
+        button.textContent = "Load older checks";
+
+    }
+
+}
+
 
 
 function closeDetails() {
+
+    currentMonitorId = null;
+
     document.getElementById("details").classList.remove("active");
+
 }
+
 
 
 function drawChart(history) {
 
     const canvas = document.getElementById("responseChart");
+
     const ctx = canvas.getContext("2d");
 
     const rect = canvas.getBoundingClientRect();
+
     const ratio = window.devicePixelRatio || 1;
 
     canvas.width = rect.width * ratio;
+
     canvas.height = rect.height * ratio;
 
     ctx.scale(ratio, ratio);
 
     const width = rect.width;
+
     const height = rect.height;
 
     ctx.clearRect(0, 0, width, height);
@@ -1416,43 +2248,69 @@ function drawChart(history) {
     if (!values.some(value => value !== null)) {
 
         ctx.fillStyle = "#8493aa";
+
         ctx.font = "13px system-ui";
-        ctx.fillText("No response time data available", 10, 30);
+
+        ctx.fillText(
+            "No response time data available",
+            10,
+            30
+        );
 
         return;
     }
 
-    const valid = values.filter(value => value !== null);
+    const valid = values.filter(
+        value => value !== null
+    );
 
     const max = Math.max(...valid, 1) * 1.2;
+
     const padding = 20;
 
     ctx.strokeStyle = "#243147";
+
     ctx.lineWidth = 1;
 
     for (let i = 0; i < 4; i++) {
-        const y = padding + i * (height - padding * 2) / 3;
+
+        const y =
+            padding + i * (height - padding * 2) / 3;
 
         ctx.beginPath();
+
         ctx.moveTo(padding, y);
+
         ctx.lineTo(width - padding, y);
+
         ctx.stroke();
+
     }
 
     const points = values.map((value, index) => {
 
-        const x = padding +
+        const x =
+            padding +
             index * (width - padding * 2) /
             Math.max(values.length - 1, 1);
 
-        const y = height - padding -
-            ((value || 0) / max) * (height - padding * 2);
+        const y =
+            height - padding -
+            ((value || 0) / max) *
+            (height - padding * 2);
 
-        return { x, y, value };
+        return {
+            x,
+            y,
+            value
+        };
+
     });
 
     ctx.strokeStyle = "#38bdf8";
+
     ctx.lineWidth = 2;
+
     ctx.beginPath();
 
     let started = false;
@@ -1460,21 +2318,34 @@ function drawChart(history) {
     for (const point of points) {
 
         if (point.value === null) {
+
             started = false;
+
             continue;
         }
 
         if (!started) {
+
             ctx.moveTo(point.x, point.y);
+
             started = true;
+
         } else {
+
             ctx.lineTo(point.x, point.y);
+
         }
+
     }
 
     ctx.stroke();
+
 }
 
+
+// =====================================================
+// EVENT LISTENERS
+// =====================================================
 
 document.getElementById("addForm").addEventListener(
     "submit",
@@ -1482,15 +2353,44 @@ document.getElementById("addForm").addEventListener(
 );
 
 
+// =====================================================
+// INITIALIZATION
+// =====================================================
+
 loadMonitors();
 
-
 checkInternetConnection();
-setInterval(checkInternetConnection, 10000);
-window.addEventListener("online", checkInternetConnection);
-window.addEventListener("offline", checkInternetConnection);
 
-refreshTimer = setInterval(loadMonitors, 15000);
+setInterval(
+    checkInternetConnection,
+    10000
+);
+
+window.addEventListener(
+    "online",
+    checkInternetConnection
+);
+
+window.addEventListener(
+    "offline",
+    checkInternetConnection
+);
+
+refreshTimer = setInterval(
+    loadMonitors,
+    15000
+);
+
+window.addEventListener("resize", () => {
+
+    if (
+        currentMonitorId !== null &&
+        currentHistory.length
+    ) {
+        drawChart(currentHistory);
+    }
+
+});
 
 </script>
 
