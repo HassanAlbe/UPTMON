@@ -2342,20 +2342,10 @@ function drawChart(history) {
 
 }
 
-
-// =====================================================
-// EVENT LISTENERS
-// =====================================================
-
 document.getElementById("addForm").addEventListener(
     "submit",
     addMonitor
 );
-
-
-// =====================================================
-// INITIALIZATION
-// =====================================================
 
 loadMonitors();
 
