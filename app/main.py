@@ -21,7 +21,7 @@ HISTORY_PAGE_SIZE = 100
 
 check_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
-
+# Znany domeny itp
 KNOWN_DOMAINS = [
     "google.com",
     "roblox.com",
@@ -51,7 +51,7 @@ KNOWN_DOMAINS = [
 ]
 
 
-
+#Proponowanie domeny
 def suggest_domain(value: str):
     value = value.strip().lower()
 
